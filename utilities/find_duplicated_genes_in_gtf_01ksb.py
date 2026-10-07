@@ -1,0 +1,388 @@
+#!/usr/bin/env python
+
+import argparse
+import pandas as pd
+import time
+import os
+import csv
+
+
+def getOptions():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Analyze a GTF annotation to determine "
+                                     "if there are multiple geneIDs with the "
+                                     "same start/end. Annotation must have "
+                                     "gene features.")
+
+    # Input data
+    parser.add_argument("-a",
+                        "--annotation",
+                        dest="inAnno",
+                        required=True,
+                        help="Annotation to be analyzed. Must have gene features.")
+
+    parser.add_argument("-m",
+                        "--manualLst",
+                        dest="manualDupGn",
+                        required=False,
+                        help="A list of genes to be manually considered duplicate genes. "
+                        "must have the columns: geneID_ORIG, geneID_NEW")
+
+    # Output data
+    parser.add_argument("-p",
+                        "--prefix",
+                        dest="prefix",
+                        required=False,
+                        help="Name for output files. Optional. Defaults to name of original file.")
+
+    parser.add_argument("-o",
+                        "--outdir",
+                        dest="outdir",
+                        required=True,
+                        help="Output directory. Must already exist.")
+
+    args = parser.parse_args()
+    return args
+
+
+def read_all_gtf_data_from_file(infile):
+    """
+    Create a pandas dataframe of a GTF file creating columns specific for geneID and transcriptID
+
+    Based on trand.io.read_exon_data_from_file
+    """
+
+    print("Reading GTF...")
+
+    omegatic = time.perf_counter()
+
+    all_gtf_columns = ['seqname', 'source', 'feature', 'start', 'end', 'score', 'strand', 'frame',
+                       'attributes', 'comments']
+
+    data = pd.read_csv(infile, sep='\t', comment='#',
+                       header=None, low_memory=False)
+    file_cols = data.columns
+
+    if len(file_cols) < len(all_gtf_columns):
+        gtf_cols = all_gtf_columns[:len(file_cols)]
+    data.columns = gtf_cols
+
+    data['seqname'] = data['seqname'].astype(str)
+    data['source'] = data['source'].astype(str)
+    data['feature'] = data['feature'].astype(str)
+    data['start'] = data['start'].astype(int)
+    data['end'] = data['end'].astype(int)
+    data['attributes'] = data['attributes'].astype(str)
+
+    data.reset_index(drop=True, inplace=True)
+
+    seqnameLst = []
+    sourceLst = []
+    featureLst = []
+    startLst = []
+    endLst = []
+    scoreLst = []
+    strandLst = []
+    frameLst = []
+    geneIDLst = []
+    transcriptIDLst = []
+    otherAttrLst = []
+
+    for row in data.to_dict('records'):
+
+        rawAttr = row['attributes']
+        attrLst = [x.strip() for x in rawAttr.strip().split(';')]
+
+        gnTrAttr = [
+            x for x in attrLst if 'gene_id' in x or 'transcript_id' in x]
+        otherAttr = [x for x in attrLst if x and x not in gnTrAttr]
+
+        gene_id, transcript_id = None, None
+
+        for item in gnTrAttr:
+
+            if 'gene_id' in item:
+                gene_id = item.split('gene_id')[1].strip().strip('\"')
+
+            elif 'transcript_id' in item:
+                transcript_id = item.split(
+                    'transcript_id')[-1].strip().strip('\"')
+
+        if not gene_id:
+            print("gene_id not found in:", row)
+            gene_id = None
+
+        if not transcript_id and row['feature'] != 'gene':
+            print("gene_symbol not found in:", row)
+            transcript_id = None
+
+        seqnameLst.append(row['seqname'])
+        sourceLst.append(row['source'])
+        featureLst.append(row['feature'])
+        startLst.append(row['start'])
+        endLst.append(row['end'])
+        scoreLst.append(row['score'])
+        strandLst.append(row['strand'])
+        frameLst.append(row['frame'])
+
+        geneIDLst.append(gene_id)
+        transcriptIDLst.append(transcript_id)
+        otherAttrLst.append("; ".join(otherAttr))
+
+    newData = pd.DataFrame(
+        {
+            'seqname': seqnameLst,
+            'source': sourceLst,
+            'feature': featureLst,
+            'start': startLst,
+            'end': endLst,
+            'score': scoreLst,
+            'strand': strandLst,
+            'frame': frameLst,
+            'geneID': geneIDLst,
+            'transcriptID': transcriptIDLst,
+            'attributes': otherAttrLst
+        })
+
+    print("GTF rows:", newData.shape[0])
+
+    newData['start'] = pd.to_numeric(newData['start'], downcast="unsigned")
+    newData['end'] = pd.to_numeric(newData['end'], downcast="unsigned")
+
+    toc = time.perf_counter()
+
+    print(f"GTF Read complete,  took {toc-omegatic:0.4f} seconds.")
+    return newData
+
+
+def createDupeList(gtfDfr, manualDupGn=None):
+
+    # Subset to gene Features
+    geneDfr = gtfDfr[gtfDfr['feature'] == "gene"].copy()
+
+    if manualDupGn:
+
+        manualDct = pd.read_csv(manualDupGn, low_memory=False, usecols=[
+                                'geneID_ORIG', 'geneID_NEW']).set_index('geneID_ORIG')['geneID_NEW'].to_dict()
+
+        for oldGene, newGene in manualDct.items():
+
+            oldStart, oldEnd = geneDfr.loc[geneDfr['geneID'] == oldGene, [
+                'start', 'end']].iloc[0]
+
+            newStart = int(
+                geneDfr.loc[geneDfr['geneID'] == newGene, 'start'].values[0])
+            newEnd = int(geneDfr.loc[geneDfr['geneID']
+                         == newGene, 'end'].values[0])
+
+            geneDfr.loc[(geneDfr['start'] == oldStart) & (
+                geneDfr['end'] == oldEnd), ['start', 'end']] = [newStart, newEnd]
+
+    # Keep geneID and attributes together so they are connected during the groupby
+    geneDfr['geneInfo'] = geneDfr.apply(
+        lambda x: (x['geneID'], x['attributes']), axis=1)
+
+    # Group by strand and start/end to find genes that have the exact same coordinates
+    grpByCoordDfr = geneDfr.groupby(['strand', 'start', 'end']).agg(
+        {'geneInfo': list, 'seqname': set}).reset_index()
+
+    # Check that each set of coordinates is only on one chromosome (just in case some weird GTF is used)
+    singleChrDup = grpByCoordDfr['seqname'].apply(lambda x: len(x) == 1)
+    if not singleChrDup.all():
+        raise Exception(
+            "There are genes belonging to more than one seqname/chromosome. Quitting.")
+    else:
+        grpByCoordDfr['seqname'] = grpByCoordDfr['seqname'].apply(
+            lambda x: list(x)[0])
+
+    # Count number of genes per start/end
+    grpByCoordDfr['numGenePerCoords'] = grpByCoordDfr['geneInfo'].apply(len)
+
+    # a = grpByCoordDfr[grpByCoordDfr['start'] == 3461315]
+
+    numGenesWDup = grpByCoordDfr[grpByCoordDfr['numGenePerCoords']
+                                 > 1]['numGenePerCoords'].sum()
+    pctDup = (numGenesWDup / len(grpByCoordDfr))
+
+    print(f"{numGenesWDup} ({pctDup:.4%} of total) have duplicate geneIDs (2+ genes with the same coordinates and multiple geneIDs)")
+
+    # Subset to only genes with dupes
+    dupeDfr = grpByCoordDfr[grpByCoordDfr['numGenePerCoords']
+                            > 1].drop('numGenePerCoords', axis=1)
+
+    # Raise a custom error to stop the program if there are no duplicate genes
+    if len(dupeDfr) == 0:
+        raise ValueError("NO DUPE ERROR")
+
+    # Sort geneIDs alphabetically
+    dupeDfr['geneInfo'] = dupeDfr['geneInfo'].apply(
+        lambda x: sorted(x, key=lambda y: y[0]))
+
+    dupeDfr = dupeDfr.rename(columns={'geneInfo': 'geneInfo_ORIG'})
+
+    # For dupes, pick the first geneID (and related attributes) alphabetically
+    # to represent all genes with the exact same coordinates
+    dupeDfr['geneID_NEW'] = dupeDfr['geneInfo_ORIG'].apply(lambda x: x[0][0])
+    dupeDfr['attributes_NEW'] = dupeDfr['geneInfo_ORIG'].apply(
+        lambda x: x[0][1])
+
+    if manualDupGn:
+
+        rowLst = []
+        for row in dupeDfr.to_dict('records'):
+            if row['geneID_NEW'] in manualDct.keys():
+                row['geneID_NEW'] = manualDct[row['geneID_NEW']]
+            rowLst.append(row)
+        dupeDfr = pd.DataFrame(rowLst)
+
+    # Make Dfr unique on original geneID, split "info" column into geneID and attributes
+    dupeDfr = dupeDfr.explode('geneInfo_ORIG')
+    dupeDfr[['geneID_ORIG', 'attributes_ORIG']] = pd.DataFrame(
+        dupeDfr['geneInfo_ORIG'].tolist(), index=dupeDfr.index)
+
+    # Reorganize and cleanup columns
+    dupeDfr = dupeDfr[['geneID_ORIG', 'attributes_ORIG', 'geneID_NEW',
+                       'attributes_NEW', 'start', 'end', 'strand', 'seqname']]
+
+    return dupeDfr
+
+
+def main():
+
+    inAnno = "/nfshome/k.bankole/mnt/exasmb.rc.ufl.edu-blue/mcintyre/share/references/dmel_fb650/dmel-all-r6.50_subset_trans_spliced_gene.gtf"
+    # inAnno = "/TB14/TB14/blue_copy/references/dsim_fb202/dsim-all-r2.02.gtf"
+    # inAnno = "/TB14/TB14/blue_copy/references/dser1.1/GCF_002093755.2/genomic.gtf"
+    # inAnno = "/TB14/TB14/blue_copy/references/dsan_Prin_1.1/GCF_016746245.2/genomic.gtf"
+    # inAnno = "/TB14/TB14/blue_copy/references/dyak_Prin_Tai18E2_2.1/GCF_016746365.2/genomic.gtf"
+    prefix = None
+    outdir = "/nfshome/k.bankole/Desktop/test_folder"
+
+    inAnno = "/TB14/TB14/bluecopy/dmel-all-r6.50_subset_trans_spliced_gene.gtf"
+    manualDupGn = "/TB14/TB14/bluecopy/list_dmel650_manual_dupe_gene.csv"
+
+    inAnno = "//exasmb.rc.ufl.edu/blue/mcintyre/share/references/dmel_fb650/dmel-all-r6.50_subset_trans_spliced_gene.gtf"
+    manualDupGn = "//exasmb.rc.ufl.edu/blue/mcintyre/share/references/dmel_fb650/list_dmel650_manual_dupe_gene.csv"
+
+    inAnno = "//exasmb.rc.ufl.edu/blue/mcintyre/share/references/dsim_fb202/dsim-all-r2.02.gtf"
+    manualDupGn = "//exasmb.rc.ufl.edu/blue/mcintyre/share/references/dsim_fb202/list_dsim202_manual_dupe_gene.csv"
+
+    inAnno = "/nfshome/k.bankole/mnt/exasmb.rc.ufl.edu-blue/mcintyre/share/references/dser1.1/GCF_002093755.2/genomic.gtf"
+    manualDupGn = "/nfshome/k.bankole/mnt/exasmb.rc.ufl.edu-blue/mcintyre/share/references/dser1.1/list_dser11_manual_dupe_gene.csv"
+
+    inAnno = args.inAnno
+    prefix = args.prefix
+    outdir = args.outdir
+    manualDupGn = args.manualDupGn
+
+    # Read GTF
+    gtfDfr = read_all_gtf_data_from_file(inAnno)
+
+    print("Num unique gene IDs:", gtfDfr['geneID'].nunique())
+
+    # Create list of duplicate genes. If there are no duplicate genes print and quit.
+    try:
+        dupeDfr = createDupeList(gtfDfr=gtfDfr, manualDupGn=manualDupGn)
+    except ValueError as error:
+        if str(error) == "NO DUPE ERROR":
+            print(
+                "\nThere are no duplicate genes in this GTF! No output will be created.")
+            quit()
+        else:
+            raise
+
+    # Create a list of genes and their xscripts
+    gene2XscriptDfr = gtfDfr[gtfDfr['feature'] != "gene"].copy()
+    gene2XscriptDfr = gene2XscriptDfr[['transcriptID', 'geneID', 'attributes']
+                                      ].drop_duplicates().dropna(ignore_index=True).copy()
+
+    # Subset this to the genes that have dupes -> store a list of transcripts
+    # that are from duplicate genes (unique on transcriptID)
+    dupeXscriptDfr = gene2XscriptDfr[gene2XscriptDfr['geneID'].isin(
+        dupeDfr['geneID_ORIG'])]
+
+    # 'Fix' original GTF by replacing duplicate genes with the first alphabetical selected earlier
+    rowLst = []
+    for row in gtfDfr.to_dict('records'):
+
+        if row['geneID'] in dupeDfr['geneID_ORIG'].tolist():
+
+            replaceInfoDct = dupeDfr[dupeDfr['geneID_ORIG']
+                                     == row['geneID']].squeeze().to_dict()
+
+            # Check that seqname and strand are the same?
+            # I'm not sure why they wouldnt be but it doesn't hurt to check
+
+            if replaceInfoDct['seqname'] != row['seqname'] and replaceInfoDct['strand'] != row['strand']:
+                raise Exception("For some reason, though they have the same coordinates, "
+                                f"the seqname/strand for {row['geneID']} in the original GTF "
+                                f"does not match the seqname/strand for {replaceInfoDct['geneID_NEW']}. Quitting.")
+
+            row['geneID'] = replaceInfoDct['geneID_NEW']
+            row['attributes'] = replaceInfoDct['attributes_NEW']
+
+        rowLst.append(row)
+
+    # New GTF using 'fixed' geneIDs
+    newGTFDfr = pd.DataFrame(rowLst)
+
+    # Check that this new GTF has the correct number of geneIDs:
+    # number of unique genes originally - (number of genes with duplicates - number of genes used to represent the duplicates)
+
+    removedGenes = set(dupeDfr['geneID_ORIG'].tolist()) - \
+        set(dupeDfr['geneID_NEW'].tolist())
+
+    correctNewNumGene = gtfDfr['geneID'].nunique() - len(removedGenes)
+    if newGTFDfr['geneID'].nunique() != correctNewNumGene:
+        raise Exception(
+            "Something went wrong. The output GTF does not have the correct number of genes.")
+    else:
+
+        # Drop duplicates to remove duplicate gene features
+        outGTFDfr = newGTFDfr.drop_duplicates().copy()
+
+    # If the removed genes are still in any of the GTF rows throw an error
+    if any(outGTFDfr.isin(removedGenes).any()):
+        raise Exception("Dupes were not correctly removed. Quitting.")
+
+    # Create attributes column for output
+    # Create a quick function to put transcriptID and geneID back in attributes
+    # (for readability I promise)
+    def createAttributes(x):
+        if x['transcriptID']:
+            return "transcript_id \"{}\"; gene_id \"{}\"; {}".format(x['transcriptID'], x['geneID'], x['attributes'])
+        else:
+            return "gene_id \"{}\"; {}".format(x['geneID'], x['attributes'])
+    outGTFDfr['attribute'] = outGTFDfr.apply(
+        lambda x: createAttributes(x), axis=1)
+
+    # OUTPUT PREFIX
+    if prefix:
+        outPrefix = "{}/{}".format(outdir, prefix)
+    else:
+        fileName = os.path.basename(inAnno).split('.gtf')[0]
+        outPrefix = "{}/{}".format(outdir, fileName)
+
+    # OUTPUT CSVs
+    dupeOutFile = f"{outPrefix}_duplicated_genes.csv"
+    dupeDfr.to_csv(dupeOutFile, index=False, quoting=csv.QUOTE_NONE)
+
+    dupXscrOutFile = f"{outPrefix}_transcripts_of_duplicated_genes.csv"
+    dupeXscriptDfr.to_csv(dupXscrOutFile, index=False,
+                          quoting=csv.QUOTE_NONE, escapechar='\\')
+
+    # OUTPUT NEW GTF
+    outColLst = ['seqname', 'source', 'feature', 'start', 'end', 'score', 'strand',
+                 'frame', 'attribute']
+    outGTFDfr = outGTFDfr.reindex(columns=outColLst)
+
+    gtfOutFile = f"{outPrefix}_noDup.gtf"
+
+    outGTFDfr.to_csv(gtfOutFile, sep="\t", index=False, header=False,
+                     doublequote=False, quoting=csv.QUOTE_NONE)
+
+
+if __name__ == '__main__':
+    # Parse command line arguments
+    global args
+    args = getOptions()
+    main()

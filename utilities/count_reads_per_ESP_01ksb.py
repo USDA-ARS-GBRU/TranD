@@ -1,0 +1,209 @@
+#!/usr/bin/env python
+
+import argparse
+import pandas as pd
+import time
+import os
+import warnings
+
+
+def getOptions():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description="Count num reads per ESP using read counts from "
+                    "UJC output (ujc_count.csv) and \"infoESP\" file. "
+                    "Output will include counts per ESP in a sample stacked format. "
+    )
+
+    # Input data
+    parser.add_argument(
+        "-i",
+        "--info-file",
+        dest="inInfoFile",
+        required=True,
+        help="ERP File"
+    )
+
+    parser.add_argument(
+        "-c",
+        "--count-file",
+        dest="inCntFile",
+        required=True,
+        help="ujc_count File"
+    )
+
+    # Output data
+    parser.add_argument(
+        "-o",
+        "--outdir",
+        dest="outdir",
+        required=True,
+        help="Output directory. Must already exist."
+    )
+
+    parser.add_argument(
+        "-x",
+        "--prefix",
+        dest="prefix",
+        required=True,
+        help="Prefix for output files. Required."
+    )
+
+    args = parser.parse_args()
+    return args
+
+
+def main():
+
+    inInfoFile = "/nfshome/k.bankole/mnt/exasmb.rc.ufl.edu-blue/mcintyre/share/sex_specific_splicing/rlr_esp_output/fiveSpecies_2_dyak2_ujc_es_vs_dyak_data_2_dyak2_ujc_noMultiGene_infoESP.csv"
+    inCntFile = "/nfshome/k.bankole/mnt/exasmb.rc.ufl.edu-blue/mcintyre/share/transcript_ortholog/dyak_data_2_dyak2_ujc_count.csv"
+
+    # inInfoFile = "/nfshome/k.bankole/mnt/exasmb.rc.ufl.edu-blue/mcintyre/share/sex_specific_splicing/test_exon_segments_on_fru_dmel6/fiveSpecies_2_dmel6_ujc_Fru_es_vs_dmel_data_FBgn0004652_job_24_run_811_ujc_infoESP.csv"
+    # inCntFile = "/nfshome/k.bankole/mnt/exasmb.rc.ufl.edu-blue/mcintyre/share/rmg_lmm_dros_data/ujc_byGene_output/dmel_data_FBgn0004652_job_24_run_811_ujc_count.csv"
+
+    # prefix = "fiveSpecies_2_dmel6_ujc_Fru_es_vs_dmel_data_FBgn0004652_job_24_run_811_ujc"
+    # outdir = "/nfshome/k.bankole/mnt/exasmb.rc.ufl.edu-blue/mcintyre/share/sex_specific_splicing/test_exon_segments_on_fru_dmel6"
+
+    inInfoFile = args.inInfoFile
+    inCntFile = args.inCntFile
+    prefix = args.prefix
+    outdir = args.outdir
+
+    alphatic = time.perf_counter()
+
+    inInfoDf = pd.read_csv(inInfoFile, low_memory=False)
+    inCntDf = pd.read_csv(inCntFile, low_memory=False)
+
+    uniqCntGeneSet = set(inCntDf['geneID'])
+    uniqESPGeneSet = set(inInfoDf['geneID'])
+
+    # espOnlyGnLst = list(uniqESPGeneSet - uniqDataGeneSet)
+    cntOnlyGnLst = list(uniqCntGeneSet - uniqESPGeneSet)
+
+    print("There should be", len(cntOnlyGnLst), "data only genes.")
+
+    genesInBoth = list(uniqESPGeneSet.intersection(uniqCntGeneSet))
+
+    infoDf = inInfoDf[inInfoDf['geneID'].isin(genesInBoth)].copy()
+    cntDf = inCntDf[inCntDf['geneID'].isin(genesInBoth)].copy()
+
+    if len(genesInBoth) != len(uniqCntGeneSet):
+        warnings.warn("WARNING !!!! There are genes that are only in the count file. "
+                      "If you did not subset the fiveSpecies ER annotation, "
+                      "there is an issue. ")
+
+    if len(genesInBoth) != len(uniqESPGeneSet):
+        raise Exception("Error. There are genes in the count file that are not "
+                        "in the ESP file. Be sure to subset the count file to "
+                        "nonMultiGene jxnHash.")
+
+    cntDf['numRead'] = cntDf['numRead'].astype(int)
+
+    sumReadCnt = cntDf['numRead'].sum()
+    cntGnDf = cntDf.groupby(['sampleID', 'geneID'])['numRead'].sum()
+
+    infoDf = infoDf.fillna(0)
+    infoDf['flagDataOnlyExon'] = inInfoDf['numDataOnlyExon'].apply(
+        lambda x: 1 if x >= 1 else 0)
+
+    numHashPerSample = pd.DataFrame(cntDf.groupby(
+        'sampleID')['jxnHash'].nunique().rename('startNum'))
+    numReadPerSample = pd.DataFrame(cntDf.groupby(
+        'sampleID')['numRead'].sum().rename('startNum'))
+
+    toc = time.perf_counter()
+    print(
+        f"File read complete! Took {toc-alphatic:0.4f} seconds.")
+
+    infoDf = infoDf[['jxnHash', 'ESP', 'geneID', 'flagDataOnlyExon']]
+
+    # Merge ESP and counts
+    espMergeDf = pd.merge(infoDf, cntDf, on='jxnHash',
+                          how='outer', indicator='merge_check')
+
+    # Check that geneIDs are the same (I don't know why they wouldn't!)
+    if all(espMergeDf['geneID_x'] == espMergeDf['geneID_y']):
+        espMergeDf['geneID'] = espMergeDf['geneID_x']
+        espMergeDf.drop(['geneID_x', 'geneID_y'], inplace=True, axis=1)
+    else:
+        raise Exception("For some reason, a jxnHash has two different geneIDs in "
+                        "the count file and the ESP file...")
+
+    # Check that the merge did not add/remove jxnHash/reads per sample
+    numHashPerSample['postESPMerge'] = espMergeDf.groupby('sampleID').nunique()[
+        'jxnHash']
+    numReadPerSample['postESPMerge'] = espMergeDf[[
+        'numRead', 'sampleID']].groupby('sampleID').sum()
+
+    if not (numHashPerSample['startNum'] == numHashPerSample['postESPMerge']).all():
+        raise Exception("The merge of the ESP and Count Files led to a "
+                        "different number of jxnHash per sample than before "
+                        "the merge.")
+
+    if not (numReadPerSample['startNum'] == numReadPerSample['postESPMerge']).all():
+        raise Exception("The merge of the ESP and Count Files led to a "
+                        "different number of reads per sample than before "
+                        "the merge.")
+
+    # Convert to unique on ESP and sum reads accross jxnHash
+    espCntDf = espMergeDf.groupby(['sampleID', 'geneID', 'ESP', 'flagDataOnlyExon']).agg({
+        'jxnHash': 'size',
+        'numRead': sum
+    }).reset_index()
+
+    numHashPerSample['postESPGrp'] = espMergeDf.groupby('sampleID').nunique()[
+        'jxnHash']
+    numReadPerSample['postESPGrp'] = espMergeDf[[
+        'numRead', 'sampleID']].groupby('sampleID').sum()
+
+    if not (numHashPerSample['startNum'] == numHashPerSample['postESPGrp']).all():
+        raise Exception("The merge of the ESP and Count Files led to a "
+                        "different number of jxnHash per sample than before "
+                        "the merge.")
+
+    if not (numReadPerSample['startNum'] == numReadPerSample['postESPGrp']).all():
+        raise Exception("The merge of the ESP and Count Files led to a "
+                        "different number of reads per sample than before "
+                        "the merge.")
+
+    # Verify that total number of reads in converted Df matches counts in input
+    if espCntDf['numRead'].sum() != cntDf['numRead'].sum():
+        raise Exception(
+            "Error: Number of total reads in output does not match number of total reads in input.")
+
+    espCntDf = espCntDf[['sampleID', 'geneID',
+                         'ESP', 'flagDataOnlyExon', 'numRead']]
+
+    sumESPCnt = espCntDf['numRead'].sum()
+    espGnDf = espCntDf.groupby(['sampleID', 'geneID'])['numRead'].sum()
+
+    if not (cntGnDf == espGnDf).all() or sumESPCnt != sumReadCnt:
+        raise Exception(
+            "Error, the number of reads per gene/the number of total reads "
+            "is not equivalent for input and output.")
+
+    print("ESP counts complete and verified!")
+
+    outPrefix = f"{outdir}/{prefix}_"
+
+    espCntFile = outPrefix + "read_per_ESP.csv"
+
+    espCntDf.to_csv(
+        espCntFile, index=False)
+
+    # if dataOnlyGnLst:
+    #     pd.Series(dataOnlyGnLst).to_csv(
+    #         outdir +
+    #         "list_{}_2_{}_ujc_cnt_only_jxnHash.txt",
+    #         index=False, header=False)
+
+    omegatoc = time.perf_counter()
+
+    print(f"Process Complete! Took {(omegatoc-alphatic):0.4f} seconds.")
+
+
+if __name__ == '__main__':
+    # Parse command line arguments
+    global args
+    args = getOptions()
+    main()
