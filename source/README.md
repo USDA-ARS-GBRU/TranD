@@ -1,5 +1,7 @@
 # TranD: Transcript Distances
 
+**Below is a basic description of the functionality of TranD. New users, please check the [Wiki](https://github.com/McIntyre-Lab/TranD/wiki). The [User Guide](https://github.com/McIntyre-Lab/TranD/wiki/User-Guide) contains more detailed information on how to run and install TranD.**
+
 TranD is a collection of tools to facilitate metrics of structural variation for whole genome
 transcript annotation files (GTF) that pinpoint structural variation to the nucleotide level.
 
@@ -41,3 +43,12 @@ pip install -r source/requirements.txt
 See the [PyPI TranD page](https://pypi.org/project/trand/) for reference.
 
 We will add a conda trand package in the near future.
+
+## Folder Description
+
+- **TMM_input** and **TMM_output**: Input and Output used in the [Transcript Model Map](https://github.com/McIntyre-Lab/TranD/wiki/Create-within-Species-Transcript-Model-Map) example for the wiki.
+- **docs**: Documentation for with details on the process of creating the [Pre-Computed Files](https://github.com/McIntyre-Lab/TranD/wiki/Precomputed-Files)
+- **source**: Contains the python code for TranD
+- **tests**: Contains shell scripts used to test TranD during development
+- **utilities**: Contains the python code for the various utilities to be used in conjunction with TranD. For more information please see the [Utility Descriptions](https://github.com/McIntyre-Lab/TranD/wiki/Utility-Descriptions-(with-Examples))
+- **utility_input** and **utility_output**: Input and Output used as examples in the [Utility Descriptions](https://github.com/McIntyre-Lab/TranD/wiki/Utility-Descriptions-(with-Examples))
