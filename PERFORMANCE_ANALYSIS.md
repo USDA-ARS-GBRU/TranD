@@ -7,10 +7,10 @@
 Key performance bottlenecks identified include:
 1. **Inefficient I/O & GTF Parsing**: Reading GTF files line-by-row in Python using `pd.read_csv` followed by `.to_dict('records')` row iterations and manual regex/string splits, creating severe memory bloating (up to several gigabytes for ~2M records) and slow parse times.
 2. **Subprocess Overheads via Bedtools (`pybedtools`)**: Excessive instantiation of `pybedtools.BedTool` objects, file system I/O, temporary file generation, and subprocess execution for interval operations (subtract, intersect, merge) on small gene/transcript intervals.
-3. **Inefficient Pairwise Comparisons ($O(N^2)$ Complexity)**: Pairwise modes construct pairwise dataframes one pair at a time using unoptimized Python loops (`itertools.combinations` / `itertools.product`) and repeated DataFrame `pd.concat` calls inside tight loops.
+3. **Inefficient & Redundant Pairwise Comparisons ($O(N^2)$ Complexity)**: Pairwise modes construct pairwise dataframes one pair at a time using unoptimized Python loops (`itertools.combinations` / `itertools.product`) and repeated DataFrame `pd.concat` calls inside tight loops. Furthermore, TranD relies strictly on matching string `gene_id`s and performs brute-force all-vs-all transcript combinations within each gene.
 4. **Multiprocessing Overhead & Inter-Process Communication (IPC)**: Passing large pandas DataFrames back and forth between parent and worker processes via `multiprocessing.Manager` list buffers causes massive serialization (pickling) overhead and memory multiplication.
 
-This document presents a comprehensive algorithmic analysis of TranD, evaluates replacing Bedtools with **Polars** and native interval algorithms (such as Interval Trees or sorted array sweeps), and proposes minimal-overhead Python/Polars optimizations alongside compiled extensions in Rust (`PyO3`) or Cython.
+This document presents a comprehensive algorithmic analysis of TranD, evaluates replacing Bedtools with **Polars** and native interval algorithms (such as Interval Trees or sorted array sweeps), explores **Genomic Interval Matching** and **K-mer/MinHash Search** for candidate pruning and homolog matching, and proposes minimal-overhead Python/Polars optimizations alongside compiled extensions in Rust (`PyO3`) or Cython.
 
 ---
 
@@ -87,7 +87,7 @@ TranD operates in two main modes: **Gene Mode** (1 GTF) and **Pairwise Mode** (1
   - `pybedtools` creates C-level temporary files or pipes for `BedTool` operations. For thousands of genes, each with multiple transcripts/pairs, millions of C/C++ `bedtools` process calls and file system operations occur.
   - Temporary files created by `pybedtools` must be repeatedly created and cleaned up (`pybedtools.cleanup()`).
 
-### 2.3 $O(N^2)$ Pairwise Comparisons with Iterative `pd.concat`
+### 2.3 Brute-Force $O(N^2)$ Pairwise Comparisons with Iterative `pd.concat`
 
 * **Current Implementation**:
   ```python
@@ -99,7 +99,7 @@ TranD operates in two main modes: **Gene Mode** (1 GTF) and **Pairwise Mode** (1
   ```
 * **Complexity & Overhead**:
   - `pd.concat` inside a loop has $O(K^2)$ cumulative time complexity, where $K$ is the number of pairs. For a gene with 100 transcripts ($N=100 \implies K = 4,950$ pairs), calling `pd.concat` repeatedly copies the entire accumulated DataFrame 4,950 times.
-  - Constructing subset DataFrames `data[data['transcript_id'] == tx]` inside tight pairwise loops performs linear scans over gene DataFrames.
+  - **Redundant Comparisons**: TranD performs a brute-force $N(N-1)/2$ all-vs-all pairwise comparison for all transcripts sharing a `gene_id`. Even when two transcripts within a large gene locus have completely non-overlapping genomic coordinates (e.g. alternative promoters separated by 100kb), TranD still executes full interval subtracts and DataFrame formatting only to mark `flag_no_ovlp_nt = 1`.
 
 ### 2.4 Range Set Interval Search in `ea_analysis`
 
@@ -127,9 +127,84 @@ TranD operates in two main modes: **Gene Mode** (1 GTF) and **Pairwise Mode** (1
 
 ---
 
-## 3. Feasibility Evaluation: Replacing Bedtools with Polars & Native Algorithms
+## 3. Evaluation of Advanced Matching Strategies: Intervals & K-mer Search
 
-### 3.1 Can Bedtools be Entirely Replaced?
+A critical design flaw in TranD's current architecture is its **rigid reliance on string `gene_id` matching** followed by **unpruned all-vs-all ($O(N^2)$) transcript comparisons**.
+
+When comparing annotations across different GTF pipelines, novel gene models, or cross-species homologs, `gene_id` strings frequently differ or are missing. Furthermore, even within a single gene, comparing every transcript isoform against every other is often unnecessary. Below, we evaluate alternative transcript matching and pruning strategies.
+
+---
+
+### 3.1 Genomic Interval Matching (Interval Trees & Spatial Indexing)
+
+#### How It Works:
+Instead of relying on `gene_id` metadata strings, transcripts are grouped and matched by their genomic bounding box `(seqname, strand, min_start, max_end)` using an **Interval Tree**, **Nested Containment List (NCList)**, or **Polars Spatial Overlap Join**.
+
+#### Feasibility & Benefits:
+1. **Cross-GTF & Homolog Loci Discovery**: Enables matching similar genes and transcripts across different GTF files even when `gene_id` names do not match (e.g., Ensembl vs. RefSeq IDs, or unannotated loci).
+2. **Early Pair Pruning ($O(N \log N)$ instead of $O(N^2)$)**:
+   - Within a gene locus, if two transcript isoforms do not overlap in genomic coordinates ($[\text{start}_1, \text{end}_1] \cap [\text{start}_2, \text{end}_2] = \emptyset$), the Interval Tree query returns no overlap in $O(\log N)$ time.
+   - Non-overlapping pairs are immediately flagged (`flag_no_ovlp_nt = 1`) or skipped, eliminating thousands of unnecessary exon-fragment subtraction operations.
+
+#### Polars / Python Interval Join Example:
+```python
+import polars as pl
+
+def find_overlapping_transcript_pairs(df_tx1: pl.DataFrame, df_tx2: pl.DataFrame) -> pl.DataFrame:
+    """
+    Find candidate transcript pairs based on genomic interval overlaps
+    without relying on gene_id string equality.
+    """
+    # Perform interval join on seqname, strand, and overlapping start/end coordinates
+    overlapping_pairs = df_tx1.join_where(
+        df_tx2,
+        pl.col("seqname") == pl.col("seqname"),
+        pl.col("strand") == pl.col("strand"),
+        pl.col("end") > pl.col("start_right"),
+        pl.col("start") < pl.col("end_right"),
+        suffix="_tx2"
+    )
+    return overlapping_pairs.select(["transcript_id", "transcript_id_tx2", "gene_id", "gene_id_tx2"])
+```
+
+---
+
+### 3.2 Similar Gene & Transcript Discovery via K-mer / MinHash Search
+
+#### How It Works:
+Instead of comparing coordinates line-by-line, each transcript is converted into a **fingerprint / signature** using:
+1. **Splice Junction Hash Sets**: A set of 64-bit integer hashes representing splice junction coordinates (`f"{chrom}:{start}:{end}:{strand}"`).
+2. **K-mer Sketches (MinHash / FracMinHash)**: Extracting k-mers (e.g., $k=21$) from exon boundary sequences or junction representations.
+
+The similarity between two transcripts $T_1$ and $T_2$ is computed as the **Jaccard Similarity**:
+$$J(T_1, T_2) = \frac{|T_1 \cap T_2|}{|T_1 \cup T_2|}$$
+
+#### Feasibility & Benefits:
+1. **$O(1)$ Full Splice Match (FSM) Detection**: Exact set or 64-bit hash equality instantly identifies FSM transcripts without running interval arithmetic.
+2. **Homolog & Paralogs Discovery Across Loci**:
+   - If two genes are paralogs or homologs located on different chromosomes or unaligned loci, coordinate-based interval matching will fail.
+   - K-mer / MinHash search on transcript sequences/junction structures can discover homologous genes and transcripts genome-wide in sub-second time.
+3. **Pre-Screening & Candidate Filtering**:
+   - Only perform detailed nucleotide-level event analysis (`transcript_distance.py`) on transcript pairs with a Jaccard similarity $J(T_1, T_2) \ge \tau$ (e.g. $\tau = 0.1$).
+
+#### Fast Junction Jaccard Pre-Screening Example:
+```python
+import polars as pl
+
+def compute_junction_jaccard(tx1_jcts: set, tx2_jcts: set) -> float:
+    """Compute Jaccard similarity between two junction catalogs."""
+    if not tx1_jcts and not tx2_jcts:
+        return 1.0  # Both mono-exonic
+    intersection = len(tx1_jcts.intersection(tx2_jcts))
+    union = len(tx1_jcts.union(tx2_jcts))
+    return intersection / union if union > 0 else 0.0
+```
+
+---
+
+## 4. Feasibility Evaluation: Replacing Bedtools with Polars & Native Algorithms
+
+### 4.1 Can Bedtools be Entirely Replaced?
 
 **Yes.** Bedtools functionality used in TranD is restricted to 1D integer interval operations on same-chromosome, same-strand features:
 1. **Interval Subtraction** ($A \setminus B$): Subtracting exon intervals from a bounding transcript interval to compute introns, or subtracting transcript 1 exons from transcript 2 exons.
@@ -138,37 +213,39 @@ TranD operates in two main modes: **Gene Mode** (1 GTF) and **Pairwise Mode** (1
 
 These operations on 1D sorted intervals can be executed natively in memory using **Polars** or direct **sweep-line algorithms** / **Interval Trees**, completely eliminating `pybedtools`, temporary files, and C++ subprocess creation.
 
-### 3.2 Polars Feasibility & Comparison Matrix
+### 4.2 Polars Feasibility & Comparison Matrix
 
 | Aspect | Current Architecture (`pandas` + `pybedtools`) | Optimized Architecture (`polars` + Vectorized Sweeps) | Performance Impact |
 | :--- | :--- | :--- | :--- |
 | **GTF Ingestion** | `pd.read_csv` + `to_dict` + Python `for` loops | `pl.read_csv` + vectorized `str.extract` | **10x–20x faster**, 80% lower RAM |
 | **Interval Subtract/Intersect**| Subprocess invocation of `bedtools` via `pybedtools` | Vectorized Polars interval overlap / NumPy sweep | **50x–100x faster**, 0 disk I/O |
+| **Pairwise Candidate Discovery**| Brute-force $O(N^2)$ combinations within `gene_id` | **Interval Trees / K-mer Jaccard** pre-filtering | **10x–100x fewer comparisons** |
 | **Pairwise Aggregation** | Python loops + `pd.concat` in tight loops | Polars pairwise self-joins + vectorized computations | **20x–50x faster**, $O(K)$ linear build |
 | **Memory Footprint** | Massive ($O(\text{length})$ range sets, dicts, pickling) | Minimal (Polars zero-copy Arrow memory arrays) | **80–90% reduction** |
 
 ---
 
-## 4. Proposed Optimizations & Minimal Architecture Changes
+## 5. Proposed Optimizations & Minimal Architecture Changes
 
-### 4.1 Optimization Plan Overview
+### 5.1 Optimization Plan Overview
 
-To achieve maximum performance with minimal code changes, we propose a 3-tier optimization strategy:
+To achieve maximum performance with minimal code changes, we propose a 4-tier optimization strategy:
 
 1. **High-Impact Vectorized GTF Reader with Polars**:
    - Fast, multithreaded GTF parsing using `polars.read_csv` with regex extraction for `gene_id` and `transcript_id`.
-2. **Pure In-Memory Sweep-Line Interval Operations**:
+2. **Interval-Based & K-mer Pair Pruning**:
+   - Pre-filter transcript pairs using Interval Trees and Junction Jaccard pre-screening before invoking nucleotide-level analysis.
+3. **Pure In-Memory Sweep-Line Interval Operations**:
    - Replace `pybedtools.BedTool` calls with exact, sorted 1D sweep-line interval algorithms implemented in pure Python/NumPy or vectorized Polars operations.
-3. **Optimized Pairwise Analysis and Aggregation**:
-   - Batch pairwise computations by pre-grouping transcript exons into memory arrays and performing list-appends before constructing a single output DataFrame (eliminating iterative `pd.concat`).
-4. **Compiled Extension (Rust with PyO3 or Cython)** *(Optional for extreme scale)*:
-   - Compile the 1D interval sweep-line and pairwise overlap calculations in Rust (`PyO3`) or Cython for ultra-low latency execution.
+4. **Optimized Pairwise Aggregation & Compiled Extension (Rust PyO3 / Cython)**:
+   - Batch pairwise computations by accumulating Python list dicts and constructing a single DataFrame at the end.
+   - Optional: Compile 1D sweep-line interval algorithms in Rust (`PyO3`) or Cython.
 
 ---
 
-## 5. Code Implementations & Benchmarks / Examples
+## 6. Code Implementations & Benchmarks / Examples
 
-### 5.1 Optimized Polars GTF Reader (`trand/io.py`)
+### 6.1 Optimized Polars GTF Reader (`trand/io.py`)
 
 Below is the implementation replacing the current `read_exon_data_from_file` in `trand/io.py`:
 
@@ -223,7 +300,7 @@ def read_exon_data_from_file_polars(infile: str, keep_src: bool = False) -> pl.D
 
 ---
 
-### 5.2 Replacing Bedtools with In-Memory 1D Interval Sweeps
+### 6.2 Replacing Bedtools with In-Memory 1D Interval Sweeps
 
 Interval subtraction ($A \setminus B$) and intersection ($A \cap B$) for sorted 1D non-overlapping intervals can be implemented cleanly without external dependencies or disk I/O.
 
@@ -307,7 +384,7 @@ def intersect_intervals(
 
 ---
 
-### 5.3 High-Performance Compiled Extension: Rust (`PyO3`)
+### 6.3 High-Performance Compiled Extension: Rust (`PyO3`)
 
 For maximum execution speed across millions of transcript pairs, interval algorithms can be compiled using Rust (`PyO3` + `maturin`).
 
@@ -358,7 +435,7 @@ fn trand_fast(_py: Python, m: &PyModule) -> PyResult<()> {
 
 ---
 
-### 5.4 Elimination of Iterative `pd.concat` in Pairwise Analysis
+### 6.4 Elimination of Iterative `pd.concat` in Pairwise Analysis
 
 Instead of repeatedly concatenating DataFrames inside loops, accumulate dicts/tuples in Python lists and construct a Polars/Pandas DataFrame once at the end:
 
@@ -395,13 +472,15 @@ def ea_pairwise_optimized(gene_id, gene_df):
 
 ---
 
-## 6. Summary of Recommended Minimal Changes
+## 7. Summary of Recommended Minimal Changes
 
 1. **Replace GTF parsing in `trand/io.py`**:
    - Replace `pd.read_csv` + dictionary loop with `polars.read_csv` and vectorized `.str.extract` expressions.
-2. **Remove `pybedtools` dependency**:
+2. **Implement Interval-based and Junction Jaccard Pruning**:
+   - Prune non-overlapping transcript pairs and pre-screen homologs using Interval Trees / Polars spatial joins and fast junction Jaccard calculations.
+3. **Remove `pybedtools` dependency**:
    - Replace `pybedtools.BedTool` calls in `trand/bedtools.py` and `trand/event_analysis.py` with pure in-memory 1D interval sweep functions (Python or compiled PyO3/Cython module).
-3. **Eliminate Iterative DataFrame Concat**:
+4. **Eliminate Iterative DataFrame Concat**:
    - Modify `ea_pairwise`, `process_single_file`, and `process_two_files` to append record dictionaries to a list and instantiate a single `pl.DataFrame` / `pd.DataFrame` per gene or run.
-4. **Optimize IPC Multiprocessing**:
+5. **Optimize IPC Multiprocessing**:
    - Instead of transmitting large DataFrames over `multiprocessing.Manager().list()`, have worker processes return list batches directly or chunk gene groups per worker process.
