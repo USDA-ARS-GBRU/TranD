@@ -17,6 +17,10 @@ struct Args {
 
     #[arg(long, default_value = "jaccard.parquet")]
     out: PathBuf,
+
+    /// Include pairs with zero exon overlap (Jaccard distance = 1.0) in the output
+    #[arg(long, default_value_t = false)]
+    include_zero_overlap: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -231,7 +235,10 @@ fn main() -> Result<()> {
     let mut res_jaccard_dists = Vec::new();
 
     let mut total_nxn_pairs: u64 = 0;
-    let mut total_compared_pairs: u64 = 0;
+    let mut bbox_overlapping_pairs: u64 = 0;
+    let mut bbox_disjoint_pruned_pairs: u64 = 0;
+    let mut exon_overlapping_pairs: u64 = 0;
+    let mut zero_exon_overlap_pairs: u64 = 0;
 
     for &&gene_id in &common_genes {
         let txs1 = &gene_models1[gene_id];
@@ -243,14 +250,28 @@ fn main() -> Result<()> {
 
         for (tid1, model1) in txs1 {
             for (tid2, model2) in txs2 {
-                total_compared_pairs += 1;
-                // Check if bounding coordinates overlap
+                // Check if transcript bounding boxes overlap
                 if model1.max_end > model2.min_start && model1.min_start < model2.max_end {
+                    bbox_overlapping_pairs += 1;
                     let jaccard_dist = calculate_jaccard_distance(&model1.exons, &model2.exons);
-                    res_gene_ids.push(gene_id.clone());
-                    res_t1_ids.push(tid1.clone());
-                    res_t2_ids.push(tid2.clone());
-                    res_jaccard_dists.push(jaccard_dist);
+
+                    if jaccard_dist < 1.0 {
+                        exon_overlapping_pairs += 1;
+                        res_gene_ids.push(gene_id.clone());
+                        res_t1_ids.push(tid1.clone());
+                        res_t2_ids.push(tid2.clone());
+                        res_jaccard_dists.push(jaccard_dist);
+                    } else {
+                        zero_exon_overlap_pairs += 1;
+                        if args.include_zero_overlap {
+                            res_gene_ids.push(gene_id.clone());
+                            res_t1_ids.push(tid1.clone());
+                            res_t2_ids.push(tid2.clone());
+                            res_jaccard_dists.push(jaccard_dist);
+                        }
+                    }
+                } else {
+                    bbox_disjoint_pruned_pairs += 1;
                 }
             }
         }
@@ -258,12 +279,15 @@ fn main() -> Result<()> {
 
     let total_output_rows = res_jaccard_dists.len();
 
-    println!("=== Processing Summary ===");
-    println!("Total common genes processed: {}", common_genes.len());
-    println!("Sum of NxN transcript pairs across all common genes: {}", total_nxn_pairs);
-    println!("Total transcript pairs compared: {}", total_compared_pairs);
-    println!("Total rows written to output file: {}", total_output_rows);
-    println!("==========================");
+    println!("=== Diagnostic & Processing Summary ===");
+    println!("Total common genes processed:                       {}", common_genes.len());
+    println!("Total NxN candidate transcript pairs within genes:   {}", total_nxn_pairs);
+    println!("Bounding-box overlapping pairs evaluated:            {}", bbox_overlapping_pairs);
+    println!("Bounding-box disjoint pairs pruned:                  {}", bbox_disjoint_pruned_pairs);
+    println!("Pairs with actual exon nucleotide overlap (J<1.0):   {}", exon_overlapping_pairs);
+    println!("Pairs with 0 exon overlap within bounding box (J=1): {}", zero_exon_overlap_pairs);
+    println!("Total rows written to output file:                  {}", total_output_rows);
+    println!("=======================================");
 
     let mut out_df = DataFrame::new(vec![
         Series::new("gene_id", res_gene_ids),
