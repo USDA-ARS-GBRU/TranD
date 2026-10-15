@@ -225,19 +225,25 @@ fn main() -> Result<()> {
     let set2: HashSet<&String> = gene_models2.keys().collect();
     let common_genes: Vec<&&String> = set1.intersection(&set2).collect();
 
-    println!("Found {} common genes", common_genes.len());
-
     let mut res_gene_ids = Vec::new();
     let mut res_t1_ids = Vec::new();
     let mut res_t2_ids = Vec::new();
     let mut res_jaccard_dists = Vec::new();
 
+    let mut total_nxn_pairs: u64 = 0;
+    let mut total_compared_pairs: u64 = 0;
+
     for &&gene_id in &common_genes {
         let txs1 = &gene_models1[gene_id];
         let txs2 = &gene_models2[gene_id];
 
+        let n1 = txs1.len() as u64;
+        let n2 = txs2.len() as u64;
+        total_nxn_pairs += n1 * n2;
+
         for (tid1, model1) in txs1 {
             for (tid2, model2) in txs2 {
+                total_compared_pairs += 1;
                 // Check if bounding coordinates overlap
                 if model1.max_end > model2.min_start && model1.min_start < model2.max_end {
                     let jaccard_dist = calculate_jaccard_distance(&model1.exons, &model2.exons);
@@ -250,7 +256,14 @@ fn main() -> Result<()> {
         }
     }
 
-    println!("Processed {} overlapping transcript pairs", res_jaccard_dists.len());
+    let total_output_rows = res_jaccard_dists.len();
+
+    println!("=== Processing Summary ===");
+    println!("Total common genes processed: {}", common_genes.len());
+    println!("Sum of NxN transcript pairs across all common genes: {}", total_nxn_pairs);
+    println!("Total transcript pairs compared: {}", total_compared_pairs);
+    println!("Total rows written to output file: {}", total_output_rows);
+    println!("==========================");
 
     let mut out_df = DataFrame::new(vec![
         Series::new("gene_id", res_gene_ids),
