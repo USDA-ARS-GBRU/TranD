@@ -1,0 +1,13 @@
+[package]
+name = "trand_rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "trand"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+polars = { version = "0.38", features = ["lazy", "parquet", "fmt"] }
+anyhow = "1.0"
